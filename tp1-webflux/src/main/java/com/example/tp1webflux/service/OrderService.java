@@ -1,35 +1,31 @@
 package com.example.tp1webflux.service;
 
-import com.example.tp1webflux.exception.InvalidOrderException;
-import com.example.tp1webflux.exception.ProductNotFoundException;
-import com.example.tp1webflux.model.Order;
-import com.example.tp1webflux.model.OrderRequest;
-import com.example.tp1webflux.model.OrderStatus;
-import com.example.tp1webflux.model.Product;
-import com.example.tp1webflux.model.ProductWithPrice;
-import com.example.tp1webflux.repository.ProductRepository;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
-
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.example.tp1webflux.exception.InvalidOrderException;
+import com.example.tp1webflux.model.Order;
+import com.example.tp1webflux.model.OrderRequest;
+import com.example.tp1webflux.model.OrderStatus;
+import com.example.tp1webflux.model.Product;
+import com.example.tp1webflux.model.ProductWithPrice;
+import com.example.tp1webflux.repository.ProductRepository;
+
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 public class OrderService {
 
     private static final Logger logger = LoggerFactory.getLogger(OrderService.class);
 
     private final ProductRepository productRepository;
-
-    // Bonus B: caching
-    private final ConcurrentHashMap<String, Mono<Product>> productCache = new ConcurrentHashMap<>();
 
     public OrderService(ProductRepository productRepository) {
         this.productRepository = productRepository;
@@ -42,18 +38,28 @@ public class OrderService {
                 .take(100)
                 .doOnNext(id -> logger.info("ID reçu et validé: {}", id))
 
-                // Bonus A: parallélisation
-                .parallel()
-                .runOn(Schedulers.parallel())
-                .flatMap(this::fetchProductSafely)
-                .sequential()
+                // batching 10
+                .buffer(10)
+                .doOnNext(batch -> logger.info("Batch créé ({} IDs) : {}", batch.size(), batch))
+
+                .flatMap(batchIds ->
+                        productRepository.findByIds(batchIds)
+                                .doOnNext(product -> logger.info("Produit récupéré depuis batch: {}", product.getId()))
+                                .onErrorResume(e -> {
+                                    logger.warn("Erreur sur batch {} : {}", batchIds, e.getMessage());
+                                    return Flux.empty();
+                                })
+                )
 
                 .filter(Product::isInStock)
                 .doOnNext(product -> logger.info("Produit en stock: {}", product.getId()))
 
                 .map(this::applyDiscount)
-                .doOnNext(pwp -> logger.info("Réduction appliquée pour {} => {}%",
-                        pwp.getProduct().getId(), pwp.getDiscountPercentage()))
+                .doOnNext(pwp -> logger.info(
+                        "Réduction appliquée pour {} => {}%",
+                        pwp.getProduct().getId(),
+                        pwp.getDiscountPercentage()
+                ))
 
                 .collectList()
                 .map(products -> buildCompletedOrder(request, products))
@@ -71,39 +77,27 @@ public class OrderService {
         if (request == null) {
             return Mono.error(new InvalidOrderException("Request must not be null"));
         }
+
         if (request.getCustomerId() == null || request.getCustomerId().isBlank()) {
             return Mono.error(new InvalidOrderException("Customer ID must not be null or blank"));
         }
+
         if (request.getProductIds() == null || request.getProductIds().isEmpty()) {
             return Mono.error(new InvalidOrderException("Product IDs must not be empty"));
         }
+
         logger.info("Requête valide pour customerId={}", request.getCustomerId());
         return Mono.empty();
-    }
-
-    private Mono<Product> fetchProductSafely(String productId) {
-        return getCachedProduct(productId)
-                .switchIfEmpty(Mono.error(new ProductNotFoundException(productId)))
-                .onErrorResume(ProductNotFoundException.class, e -> {
-                    logger.warn("Produit introuvable ignoré: {}", productId);
-                    return Mono.empty();
-                })
-                .onErrorResume(e -> {
-                    logger.warn("Erreur repository ignorée pour {} : {}", productId, e.getMessage());
-                    return Mono.empty();
-                });
-    }
-
-    private Mono<Product> getCachedProduct(String productId) {
-        return productCache.computeIfAbsent(productId, id -> productRepository.findById(id).cache());
     }
 
     private ProductWithPrice applyDiscount(Product product) {
         int discount = "ELECTRONICS".equalsIgnoreCase(product.getCategory()) ? 10 : 5;
 
         BigDecimal originalPrice = product.getPrice();
+
         BigDecimal discountFactor = BigDecimal.valueOf(100 - discount)
                 .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+
         BigDecimal finalPrice = originalPrice.multiply(discountFactor)
                 .setScale(2, RoundingMode.HALF_UP);
 
