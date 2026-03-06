@@ -1,0 +1,10 @@
+spring:
+  application:
+    name: exercise-12-orders
+  r2dbc:
+    url: r2dbc:h2:mem:///ordersdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always
